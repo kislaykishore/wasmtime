@@ -24,7 +24,7 @@ pub mod bindings {
                 tracing: true,
                 with: {
                     "wasi:io/streams": wasmtime_wasi::preview2::bindings::sync_io::io::streams,
-                    "wasi:poll/poll": wasmtime_wasi::preview2::bindings::sync_io::poll::poll,
+                    "wasi:io/poll": wasmtime_wasi::preview2::bindings::sync_io::io::poll,
                 }
             });
         }
@@ -43,7 +43,7 @@ pub mod bindings {
             async: true,
             with: {
                 "wasi:io/streams": wasmtime_wasi::preview2::bindings::io::streams,
-                "wasi:poll/poll": wasmtime_wasi::preview2::bindings::poll::poll,
+                "wasi:io/poll": wasmtime_wasi::preview2::bindings::io::poll,
             }
         });
     }
@@ -51,14 +51,18 @@ pub mod bindings {
     pub use self::_internal_rest::wasi::http;
 }
 
-pub fn add_to_linker<T: WasiHttpView>(linker: &mut wasmtime::Linker<T>) -> anyhow::Result<()> {
+pub fn add_to_linker<T: WasiHttpView + Sync>(
+    linker: &mut wasmtime::Linker<T>,
+) -> anyhow::Result<()> {
     crate::component_impl::add_component_to_linker::<T>(linker, |t| t)
 }
 
 pub mod sync {
     use crate::types::WasiHttpView;
 
-    pub fn add_to_linker<T: WasiHttpView>(linker: &mut wasmtime::Linker<T>) -> anyhow::Result<()> {
+    pub fn add_to_linker<T: WasiHttpView + Sync>(
+        linker: &mut wasmtime::Linker<T>,
+    ) -> anyhow::Result<()> {
         crate::component_impl::sync::add_component_to_linker::<T>(linker, |t| t)
     }
 }

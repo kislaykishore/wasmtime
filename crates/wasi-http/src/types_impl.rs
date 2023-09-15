@@ -8,7 +8,8 @@ use crate::types::{ActiveFields, ActiveRequest, HttpRequest, TableHttpExt};
 use crate::WasiHttpView;
 use anyhow::{anyhow, bail, Context};
 use bytes::Bytes;
-use wasmtime_wasi::preview2::{bindings::poll::poll::Pollable, HostPollable, TablePollableExt};
+use wasmtime::component::Resource;
+use wasmtime_wasi::preview2::{bindings::io::poll::Pollable, HostPollable, TablePollableExt};
 
 #[async_trait::async_trait]
 impl<T: WasiHttpView + WasiHttpViewExt> crate::bindings::http::types::Host for T {
@@ -104,7 +105,7 @@ impl<T: WasiHttpView + WasiHttpViewExt> crate::bindings::http::types::Host for T
     }
     async fn finish_incoming_stream(
         &mut self,
-        stream_id: IncomingStream,
+        stream_id: Resource<IncomingStream>,
     ) -> wasmtime::Result<Option<Trailers>> {
         for (_, stream) in self.http_ctx().streams.iter() {
             if stream_id == stream.incoming() {
@@ -119,7 +120,7 @@ impl<T: WasiHttpView + WasiHttpViewExt> crate::bindings::http::types::Host for T
     }
     async fn finish_outgoing_stream(
         &mut self,
-        _s: OutgoingStream,
+        _s: Resource<OutgoingStream>,
         _trailers: Option<Trailers>,
     ) -> wasmtime::Result<()> {
         bail!("unimplemented: finish_outgoing_stream")
@@ -385,13 +386,13 @@ impl<T: WasiHttpView + WasiHttpViewExt> crate::bindings::http::types::Host for T
     async fn listen_to_future_incoming_response(
         &mut self,
         future: FutureIncomingResponse,
-    ) -> wasmtime::Result<Pollable> {
+    ) -> wasmtime::Result<Resource<Pollable>> {
         let f = self
             .table()
             .get_future(future)
             .context("[listen_to_future_incoming_response] getting future")?;
         Ok(match f.pollable_id() {
-            Some(pollable_id) => pollable_id,
+            Some(pollable_id) => Resource::new_own(pollable_id),
             None => {
                 tracing::debug!("including pollable id to future incoming response");
                 let pollable =
@@ -404,7 +405,7 @@ impl<T: WasiHttpView + WasiHttpViewExt> crate::bindings::http::types::Host for T
                     .table_mut()
                     .get_future_mut(future)
                     .context("[listen_to_future_incoming_response] getting future")?;
-                f.set_pollable_id(pollable_id);
+                f.set_pollable_id(pollable_id.rep());
                 tracing::trace!("future incoming response details {:?}", *f);
                 pollable_id
             }
@@ -424,7 +425,8 @@ pub mod sync {
     };
     use crate::http_impl::WasiHttpViewExt;
     use crate::WasiHttpView;
-    use wasmtime_wasi::preview2::{bindings::poll::poll::Pollable, in_tokio};
+    use wasmtime::component::Resource;
+    use wasmtime_wasi::preview2::{bindings::sync_io::io::poll::Pollable, in_tokio};
 
     // same boilerplate everywhere, converting between two identical types with different
     // definition sites. one day wasmtime-wit-bindgen will make all this unnecessary
@@ -541,16 +543,25 @@ pub mod sync {
         }
         fn finish_incoming_stream(
             &mut self,
-            stream_id: IncomingStream,
+            stream_id: Resource<IncomingStream>,
         ) -> wasmtime::Result<Option<Trailers>> {
-            in_tokio(async { AsyncHost::finish_incoming_stream(self, stream_id).await })
+            in_tokio(async {
+                AsyncHost::finish_incoming_stream(self, Resource::new_borrow(stream_id.rep())).await
+            })
         }
         fn finish_outgoing_stream(
             &mut self,
-            stream: OutgoingStream,
+            stream: Resource<OutgoingStream>,
             trailers: Option<Trailers>,
         ) -> wasmtime::Result<()> {
-            in_tokio(async { AsyncHost::finish_outgoing_stream(self, stream, trailers).await })
+            in_tokio(async {
+                AsyncHost::finish_outgoing_stream(
+                    self,
+                    Resource::new_borrow(stream.rep()),
+                    trailers,
+                )
+                .await
+            })
         }
         fn drop_incoming_request(&mut self, request: IncomingRequest) -> wasmtime::Result<()> {
             in_tokio(async { AsyncHost::drop_incoming_request(self, request).await })
@@ -595,8 +606,11 @@ pub mod sync {
         fn incoming_request_consume(
             &mut self,
             request: IncomingRequest,
-        ) -> wasmtime::Result<Result<IncomingStream, ()>> {
-            in_tokio(async { AsyncHost::incoming_request_consume(self, request).await })
+        ) -> wasmtime::Result<Result<Resource<IncomingStream>, ()>> {
+            Ok(
+                in_tokio(async { AsyncHost::incoming_request_consume(self, request).await })?
+                    .map(|resource| Resource::new_own(resource.rep())),
+            )
         }
         fn new_outgoing_request(
             &mut self,
@@ -621,8 +635,11 @@ pub mod sync {
         fn outgoing_request_write(
             &mut self,
             request: OutgoingRequest,
-        ) -> wasmtime::Result<Result<OutgoingStream, ()>> {
-            in_tokio(async { AsyncHost::outgoing_request_write(self, request).await })
+        ) -> wasmtime::Result<Result<Resource<OutgoingStream>, ()>> {
+            Ok(
+                in_tokio(async { AsyncHost::outgoing_request_write(self, request).await })?
+                    .map(|resource| Resource::new_own(resource.rep())),
+            )
         }
         fn drop_response_outparam(&mut self, response: ResponseOutparam) -> wasmtime::Result<()> {
             in_tokio(async { AsyncHost::drop_response_outparam(self, response).await })
@@ -658,8 +675,11 @@ pub mod sync {
         fn incoming_response_consume(
             &mut self,
             response: IncomingResponse,
-        ) -> wasmtime::Result<Result<IncomingStream, ()>> {
-            in_tokio(async { AsyncHost::incoming_response_consume(self, response).await })
+        ) -> wasmtime::Result<Result<Resource<IncomingStream>, ()>> {
+            Ok(
+                in_tokio(async { AsyncHost::incoming_response_consume(self, response).await })?
+                    .map(|resource| Resource::new_own(resource.rep())),
+            )
         }
         fn new_outgoing_response(
             &mut self,
@@ -671,8 +691,11 @@ pub mod sync {
         fn outgoing_response_write(
             &mut self,
             response: OutgoingResponse,
-        ) -> wasmtime::Result<Result<OutgoingStream, ()>> {
-            in_tokio(async { AsyncHost::outgoing_response_write(self, response).await })
+        ) -> wasmtime::Result<Result<Resource<OutgoingStream>, ()>> {
+            Ok(
+                in_tokio(async { AsyncHost::outgoing_response_write(self, response).await })?
+                    .map(|resource| Resource::new_own(resource.rep())),
+            )
         }
         fn drop_future_incoming_response(
             &mut self,
@@ -692,8 +715,13 @@ pub mod sync {
         fn listen_to_future_incoming_response(
             &mut self,
             future: FutureIncomingResponse,
-        ) -> wasmtime::Result<Pollable> {
-            in_tokio(async { AsyncHost::listen_to_future_incoming_response(self, future).await })
+        ) -> wasmtime::Result<Resource<Pollable>> {
+            Ok(Resource::new_own(
+                in_tokio(async {
+                    AsyncHost::listen_to_future_incoming_response(self, future).await
+                })?
+                .rep(),
+            ))
         }
     }
 }
