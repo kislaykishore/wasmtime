@@ -248,7 +248,7 @@ impl<T: WasiHttpView> WasiHttpViewExt for T {
                     .get_stream(id)
                     .context("[handle_async] getting stream")?;
                 let input_stream = table
-                    .get_input_stream_mut(stream.incoming())
+                    .get_input_stream_mut(&stream.incoming())
                     .context("[handle_async] getting mutable input stream")?;
                 let mut bytes = BytesMut::new();
                 let mut eof = StreamState::Open;

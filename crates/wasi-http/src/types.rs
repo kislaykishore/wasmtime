@@ -8,6 +8,7 @@ use bytes::Bytes;
 use std::any::Any;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
+use wasmtime::component::Resource;
 use wasmtime_wasi::preview2::{
     pipe::{AsyncReadStream, AsyncWriteStream},
     HostInputStream, HostOutputStream, Table, TableError, TableStreamExt, WasiView,
@@ -258,15 +259,19 @@ impl DerefMut for ActiveFields {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Stream {
-    input_id: u32,
-    output_id: u32,
+    input_id: Resource<IncomingStream>,
+    output_id: Resource<OutgoingStream>,
     parent_id: u32,
 }
 
 impl Stream {
-    pub fn new(input_id: u32, output_id: u32, parent_id: u32) -> Self {
+    pub fn new(
+        input_id: Resource<IncomingStream>,
+        output_id: Resource<OutgoingStream>,
+        parent_id: u32,
+    ) -> Self {
         Self {
             input_id,
             output_id,
@@ -274,11 +279,11 @@ impl Stream {
         }
     }
 
-    pub fn incoming(&self) -> IncomingStream {
+    pub fn incoming(&self) -> Resource<IncomingStream> {
         self.input_id
     }
 
-    pub fn outgoing(&self) -> OutgoingStream {
+    pub fn outgoing(&self) -> Resource<OutgoingStream> {
         self.output_id
     }
 
