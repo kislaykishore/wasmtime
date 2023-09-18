@@ -87,7 +87,7 @@ pub async fn request(
             pollable: streams::subscribe_to_output_stream(request_body),
         };
         while !buf.is_empty() {
-            poll::poll_list(&[sub.pollable]);
+            test_programs::poll_list(&[sub.pollable]);
 
             let permit = match streams::check_write(request_body) {
                 Ok(n) => n,
@@ -109,7 +109,7 @@ pub async fn request(
             _ => {}
         }
 
-        poll::poll_oneoff(&[sub.pollable]);
+        test_programs::poll_oneoff(&[sub.pollable]);
 
         match streams::check_write(request_body) {
             Ok(_) => {}
@@ -123,7 +123,7 @@ pub async fn request(
         Some(result) => result,
         None => {
             let pollable = http_types::listen_to_future_incoming_response(future_response);
-            let _ = poll::poll_oneoff(&[pollable]);
+            let _ = test_programs::poll_oneoff(&[pollable]);
             http_types::future_incoming_response_get(future_response)
                 .expect("incoming response available")
         }
