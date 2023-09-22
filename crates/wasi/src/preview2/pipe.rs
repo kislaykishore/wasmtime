@@ -7,7 +7,7 @@
 //! Some convenience constructors are included for common backing types like `Vec<u8>` and `String`,
 //! but the virtual pipes can be instantiated with any `Read` or `Write` type.
 //!
-use crate::preview2::{HostInputStream, HostOutputStream, OutputStreamError, StreamState};
+use crate::preview2::{HostInputStream, HostOutputStream, StreamError};
 use anyhow::{anyhow, Error};
 use bytes::Bytes;
 use std::sync::{Arc, Mutex};
@@ -32,21 +32,17 @@ impl MemoryInputPipe {
 
 #[async_trait::async_trait]
 impl HostInputStream for MemoryInputPipe {
-    fn read(&mut self, size: usize) -> Result<(Bytes, StreamState), Error> {
+    fn read(&mut self, size: usize) -> Result<Bytes, StreamError> {
         if self.is_empty() {
-            return Ok((Bytes::new(), StreamState::Closed));
+            return Err(StreamError::Closed);
         }
 
         let mut dest = bytes::BytesMut::zeroed(size);
-        let nbytes = std::io::Read::read(&mut self.buffer, dest.as_mut())?;
+        let nbytes = std::io::Read::read(&mut self.buffer, dest.as_mut())
+            .map_err(|e| StreamError::LastOperationFailed(e.into()))?;
         dest.truncate(nbytes);
 
-        let state = if self.is_empty() {
-            StreamState::Closed
-        } else {
-            StreamState::Open
-        };
-        Ok((dest.freeze(), state))
+        Ok(dest.freeze())
     }
     async fn ready(&mut self) -> Result<(), Error> {
         Ok(())
@@ -78,10 +74,10 @@ impl MemoryOutputPipe {
 
 #[async_trait::async_trait]
 impl HostOutputStream for MemoryOutputPipe {
-    fn write(&mut self, bytes: Bytes) -> Result<(), OutputStreamError> {
+    fn write(&mut self, bytes: Bytes) -> Result<(), StreamError> {
         let mut buf = self.buffer.lock().unwrap();
         if bytes.len() > self.capacity - buf.len() {
-            return Err(OutputStreamError::Trap(anyhow!(
+            return Err(StreamError::Trap(anyhow!(
                 "write beyond capacity of MemoryOutputPipe"
             )));
         }
@@ -89,17 +85,17 @@ impl HostOutputStream for MemoryOutputPipe {
         // Always ready for writing
         Ok(())
     }
-    fn flush(&mut self) -> Result<(), OutputStreamError> {
+    fn flush(&mut self) -> Result<(), StreamError> {
         // This stream is always flushed
         Ok(())
     }
-    async fn write_ready(&mut self) -> Result<usize, OutputStreamError> {
+    async fn write_ready(&mut self) -> Result<usize, StreamError> {
         let consumed = self.buffer.lock().unwrap().len();
         if consumed < self.capacity {
             Ok(self.capacity - consumed)
         } else {
             // Since the buffer is full, no more bytes will ever be written
-            Err(OutputStreamError::Closed)
+            Err(StreamError::Closed)
         }
     }
 }
@@ -117,9 +113,9 @@ pub fn pipe(size: usize) -> (AsyncReadStream, AsyncWriteStream) {
 
 /// Provides a [`HostInputStream`] impl from a [`tokio::io::AsyncRead`] impl
 pub struct AsyncReadStream {
-    state: StreamState,
-    buffer: Option<Result<Bytes, std::io::Error>>,
-    receiver: mpsc::Receiver<Result<(Bytes, StreamState), std::io::Error>>,
+    open: bool,
+    buffer: Option<Result<Bytes, StreamError>>,
+    receiver: mpsc::Receiver<Result<Bytes, StreamError>>,
     #[allow(unused)] // just used to implement unix stdin
     pub(crate) join_handle: crate::preview2::AbortOnDropJoinHandle<()>,
 }
@@ -134,11 +130,13 @@ impl AsyncReadStream {
                 use tokio::io::AsyncReadExt;
                 let mut buf = bytes::BytesMut::with_capacity(4096);
                 let sent = match reader.read_buf(&mut buf).await {
-                    Ok(nbytes) if nbytes == 0 => {
-                        sender.send(Ok((Bytes::new(), StreamState::Closed))).await
+                    Ok(nbytes) if nbytes == 0 => sender.send(Err(StreamError::Closed)).await,
+                    Ok(_) => sender.send(Ok(buf.freeze())).await,
+                    Err(e) => {
+                        sender
+                            .send(Err(StreamError::LastOperationFailed(e.into())))
+                            .await
                     }
-                    Ok(_) => sender.send(Ok((buf.freeze(), StreamState::Open))).await,
-                    Err(e) => sender.send(Err(e)).await,
                 };
                 if sent.is_err() {
                     // no more receiver - stop trying to read
@@ -147,7 +145,7 @@ impl AsyncReadStream {
             }
         });
         AsyncReadStream {
-            state: StreamState::Open,
+            open: true,
             buffer: None,
             receiver,
             join_handle,
@@ -157,67 +155,60 @@ impl AsyncReadStream {
 
 #[async_trait::async_trait]
 impl HostInputStream for AsyncReadStream {
-    fn read(&mut self, size: usize) -> Result<(Bytes, StreamState), Error> {
+    fn read(&mut self, size: usize) -> Result<Bytes, StreamError> {
         use mpsc::error::TryRecvError;
+        if !self.open {
+            return Err(StreamError::Closed);
+        }
 
         match self.buffer.take() {
             Some(Ok(mut bytes)) => {
                 // TODO: de-duplicate the buffer management with the case below
                 let len = bytes.len().min(size);
                 let rest = bytes.split_off(len);
-                let return_state = if !rest.is_empty() {
+                if !rest.is_empty() {
                     self.buffer = Some(Ok(rest));
-                    StreamState::Open
-                } else {
-                    self.state
                 };
-                return Ok((bytes, return_state));
+                return Ok(bytes);
             }
-            Some(Err(e)) => return Err(e.into()),
+            Some(Err(e)) => {
+                self.open = false;
+                return Err(e);
+            }
             None => {}
         }
 
         match self.receiver.try_recv() {
-            Ok(Ok((mut bytes, state))) => {
-                self.state = state;
-
+            Ok(Ok(mut bytes)) => {
                 let len = bytes.len().min(size);
                 let rest = bytes.split_off(len);
-                let return_state = if !rest.is_empty() {
+                if !rest.is_empty() {
                     self.buffer = Some(Ok(rest));
-                    StreamState::Open
-                } else {
-                    self.state
-                };
-
-                Ok((bytes, return_state))
+                }
+                Ok(bytes)
             }
-            Ok(Err(e)) => Err(e.into()),
-            Err(TryRecvError::Empty) => Ok((Bytes::new(), self.state)),
-            Err(TryRecvError::Disconnected) => Err(anyhow!(
-                "AsyncReadStream sender died - should be impossible"
-            )),
+            Ok(Err(e)) => {
+                self.open = false;
+                Err(e)
+            }
+            Err(TryRecvError::Empty) => Ok(Bytes::new()),
+            Err(TryRecvError::Disconnected) => {
+                self.open = false;
+                Err(StreamError::Trap(anyhow!(
+                    "AsyncReadStream sender died - should be impossible"
+                )))
+            }
         }
     }
 
     async fn ready(&mut self) -> Result<(), Error> {
-        if self.buffer.is_some() || self.state == StreamState::Closed {
+        if self.buffer.is_some() || !self.open {
             return Ok(());
         }
-        match self.receiver.recv().await {
-            Some(Ok((bytes, state))) => {
-                if state == StreamState::Closed {
-                    self.state = state;
-                }
-                self.buffer = Some(Ok(bytes));
-            }
-            Some(Err(e)) => self.buffer = Some(Err(e)),
-            None => {
-                return Err(anyhow!(
-                    "no more sender for an open AsyncReadStream - should be impossible"
-                ))
-            }
-        }
+        let msg = self.receiver.recv().await.ok_or_else(|| {
+            anyhow!("no more sender for an open AsyncReadStream - should be impossible")
+        })?;
+        self.buffer = Some(msg);
         Ok(())
     }
 }
@@ -232,12 +223,12 @@ struct WorkerState {
 }
 
 impl WorkerState {
-    fn check_error(&mut self) -> Result<(), OutputStreamError> {
+    fn check_error(&mut self) -> Result<(), StreamError> {
         if let Some(e) = self.error.take() {
-            return Err(OutputStreamError::LastOperationFailed(e));
+            return Err(StreamError::LastOperationFailed(e));
         }
         if !self.alive {
-            return Err(OutputStreamError::Closed);
+            return Err(StreamError::Closed);
         }
         Ok(())
     }
@@ -255,7 +246,7 @@ enum Job {
 }
 
 enum WriteStatus<'a> {
-    Done(Result<usize, OutputStreamError>),
+    Done(Result<usize, StreamError>),
     Pending(tokio::sync::futures::Notified<'a>),
 }
 
@@ -375,11 +366,11 @@ impl AsyncWriteStream {
 
 #[async_trait::async_trait]
 impl HostOutputStream for AsyncWriteStream {
-    fn write(&mut self, bytes: Bytes) -> Result<(), OutputStreamError> {
+    fn write(&mut self, bytes: Bytes) -> Result<(), StreamError> {
         let mut state = self.worker.state();
         state.check_error()?;
         if state.flush_pending {
-            return Err(OutputStreamError::Trap(anyhow!(
+            return Err(StreamError::Trap(anyhow!(
                 "write not permitted while flush pending"
             )));
         }
@@ -388,13 +379,13 @@ impl HostOutputStream for AsyncWriteStream {
                 state.write_budget = remaining_budget;
                 state.items.push_back(bytes);
             }
-            None => return Err(OutputStreamError::Trap(anyhow!("write exceeded budget"))),
+            None => return Err(StreamError::Trap(anyhow!("write exceeded budget"))),
         }
         drop(state);
         self.worker.new_work.notify_waiters();
         Ok(())
     }
-    fn flush(&mut self) -> Result<(), OutputStreamError> {
+    fn flush(&mut self) -> Result<(), StreamError> {
         let mut state = self.worker.state();
         state.check_error()?;
 
@@ -404,7 +395,7 @@ impl HostOutputStream for AsyncWriteStream {
         Ok(())
     }
 
-    async fn write_ready(&mut self) -> Result<usize, OutputStreamError> {
+    async fn write_ready(&mut self) -> Result<usize, StreamError> {
         loop {
             match self.worker.check_write() {
                 WriteStatus::Done(r) => return r,
@@ -419,15 +410,15 @@ pub struct SinkOutputStream;
 
 #[async_trait::async_trait]
 impl HostOutputStream for SinkOutputStream {
-    fn write(&mut self, _buf: Bytes) -> Result<(), OutputStreamError> {
+    fn write(&mut self, _buf: Bytes) -> Result<(), StreamError> {
         Ok(())
     }
-    fn flush(&mut self) -> Result<(), OutputStreamError> {
+    fn flush(&mut self) -> Result<(), StreamError> {
         // This stream is always flushed
         Ok(())
     }
 
-    async fn write_ready(&mut self) -> Result<usize, OutputStreamError> {
+    async fn write_ready(&mut self) -> Result<usize, StreamError> {
         // This stream is always ready for writing.
         Ok(usize::MAX)
     }
@@ -438,8 +429,8 @@ pub struct ClosedInputStream;
 
 #[async_trait::async_trait]
 impl HostInputStream for ClosedInputStream {
-    fn read(&mut self, _size: usize) -> Result<(Bytes, StreamState), Error> {
-        Ok((Bytes::new(), StreamState::Closed))
+    fn read(&mut self, _size: usize) -> Result<Bytes, StreamError> {
+        Err(StreamError::Closed)
     }
 
     async fn ready(&mut self) -> Result<(), Error> {
@@ -452,15 +443,14 @@ pub struct ClosedOutputStream;
 
 #[async_trait::async_trait]
 impl HostOutputStream for ClosedOutputStream {
-    fn write(&mut self, _: Bytes) -> Result<(), OutputStreamError> {
-        Err(OutputStreamError::Closed)
+    fn write(&mut self, _: Bytes) -> Result<(), StreamError> {
+        Err(StreamError::Closed)
     }
-    fn flush(&mut self) -> Result<(), OutputStreamError> {
-        Err(OutputStreamError::Closed)
+    fn flush(&mut self) -> Result<(), StreamError> {
+        Err(StreamError::Closed)
     }
-
-    async fn write_ready(&mut self) -> Result<usize, OutputStreamError> {
-        Err(OutputStreamError::Closed)
+    async fn write_ready(&mut self) -> Result<usize, StreamError> {
+        Err(StreamError::Closed)
     }
 }
 
@@ -511,24 +501,25 @@ mod test {
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn empty_read_stream() {
         let mut reader = AsyncReadStream::new(tokio::io::empty());
-        let (bs, state) = reader.read(10).unwrap();
-        assert!(bs.is_empty());
+        let res = reader.read(10);
 
         // In a multi-threaded context, the value of state is not deterministic -- the spawned
         // reader task may run on a different thread.
-        match state {
+        match res {
             // The reader task ran before we tried to read, and noticed that the input was empty.
-            StreamState::Closed => {}
+            Err(StreamError::Closed) => {}
 
             // The reader task hasn't run yet. Call `ready` to await and fill the buffer.
-            StreamState::Open => {
+            Ok(bs) => {
+                assert!(bs.is_empty());
                 resolves_immediately(reader.ready())
                     .await
                     .expect("ready is ok");
-                let (bs, state) = reader.read(0).unwrap();
-                assert!(bs.is_empty());
-                assert_eq!(state, StreamState::Closed);
+                let r = reader.read(0);
+                assert!(matches!(r, Err(StreamError::Closed)));
             }
+
+            _ => panic!("unexpected result {res:?}"),
         }
     }
 
@@ -536,29 +527,25 @@ mod test {
     async fn infinite_read_stream() {
         let mut reader = AsyncReadStream::new(tokio::io::repeat(0));
 
-        let (bs, state) = reader.read(10).unwrap();
-        assert_eq!(state, StreamState::Open);
+        let bs = reader.read(10).unwrap();
         if bs.is_empty() {
             // Reader task hasn't run yet. Call `ready` to await and fill the buffer.
             resolves_immediately(reader.ready())
                 .await
                 .expect("ready is ok");
             // Now a read should succeed
-            let (bs, state) = reader.read(10).unwrap();
+            let bs = reader.read(10).unwrap();
             assert_eq!(bs.len(), 10);
-            assert_eq!(state, StreamState::Open);
         } else {
             assert_eq!(bs.len(), 10);
         }
 
         // Subsequent reads should succeed
-        let (bs, state) = reader.read(10).unwrap();
-        assert_eq!(state, StreamState::Open);
+        let bs = reader.read(10).unwrap();
         assert_eq!(bs.len(), 10);
 
         // Even 0-length reads should succeed and show its open
-        let (bs, state) = reader.read(0).unwrap();
-        assert_eq!(state, StreamState::Open);
+        let bs = reader.read(0).unwrap();
         assert_eq!(bs.len(), 0);
     }
 
@@ -572,37 +559,35 @@ mod test {
     async fn finite_read_stream() {
         let mut reader = AsyncReadStream::new(finite_async_reader(&[1; 123]).await);
 
-        let (bs, state) = reader.read(123).unwrap();
-        assert_eq!(state, StreamState::Open);
+        let bs = reader.read(123).unwrap();
         if bs.is_empty() {
             // Reader task hasn't run yet. Call `ready` to await and fill the buffer.
             resolves_immediately(reader.ready())
                 .await
                 .expect("ready is ok");
             // Now a read should succeed
-            let (bs, state) = reader.read(123).unwrap();
+            let bs = reader.read(123).unwrap();
             assert_eq!(bs.len(), 123);
-            assert_eq!(state, StreamState::Open);
         } else {
             assert_eq!(bs.len(), 123);
         }
 
         // The AsyncRead's should be empty now, but we have a race where the reader task hasn't
         // yet send that to the AsyncReadStream.
-        let (bs, state) = reader.read(0).unwrap();
-        assert!(bs.is_empty());
-        match state {
-            StreamState::Closed => {} // Correct!
-            StreamState::Open => {
+        let res = reader.read(0);
+        match res {
+            Err(StreamError::Closed) => {} // Correct!
+            Ok(bs) => {
+                assert_eq!(bs.len(), 0);
                 // Need to await to give this side time to catch up
                 resolves_immediately(reader.ready())
                     .await
                     .expect("ready is ok");
                 // Now a read should show closed
-                let (bs, state) = reader.read(0).unwrap();
-                assert_eq!(bs.len(), 0);
-                assert_eq!(state, StreamState::Closed);
+                let res = reader.read(0);
+                assert!(matches!(res, Err(StreamError::Closed)));
             }
+            _ => panic!("unexpected result {res:?}"),
         }
     }
 
@@ -615,33 +600,29 @@ mod test {
 
         w.write_all(&[123]).await.unwrap();
 
-        let (bs, state) = reader.read(1).unwrap();
-        assert_eq!(state, StreamState::Open);
+        let bs = reader.read(1).unwrap();
         if bs.is_empty() {
             // Reader task hasn't run yet. Call `ready` to await and fill the buffer.
             resolves_immediately(reader.ready())
                 .await
                 .expect("ready is ok");
             // Now a read should succeed
-            let (bs, state) = reader.read(1).unwrap();
+            let bs = reader.read(1).unwrap();
             assert_eq!(*bs, [123u8]);
-            assert_eq!(state, StreamState::Open);
         } else {
             assert_eq!(*bs, [123u8]);
         }
 
         // The stream should be empty and open now:
-        let (bs, state) = reader.read(1).unwrap();
+        let bs = reader.read(1).unwrap();
         assert!(bs.is_empty());
-        assert_eq!(state, StreamState::Open);
 
         // We can wait on readiness and it will time out:
         never_resolves(reader.ready()).await;
 
         // Still open and empty:
-        let (bs, state) = reader.read(1).unwrap();
+        let bs = reader.read(1).unwrap();
         assert!(bs.is_empty());
-        assert_eq!(state, StreamState::Open);
 
         // Put something else in the stream:
         w.write_all(&[45]).await.unwrap();
@@ -653,22 +634,19 @@ mod test {
             .expect("the ready is ok");
 
         // read the something else back out:
-        let (bs, state) = reader.read(1).unwrap();
+        let bs = reader.read(1).unwrap();
         assert_eq!(*bs, [45u8]);
-        assert_eq!(state, StreamState::Open);
 
         // nothing else in there:
-        let (bs, state) = reader.read(1).unwrap();
+        let bs = reader.read(1).unwrap();
         assert!(bs.is_empty());
-        assert_eq!(state, StreamState::Open);
 
         // We can wait on readiness and it will time out:
         never_resolves(reader.ready()).await;
 
         // nothing else in there:
-        let (bs, state) = reader.read(1).unwrap();
+        let bs = reader.read(1).unwrap();
         assert!(bs.is_empty());
-        assert_eq!(state, StreamState::Open);
 
         // Now close the pipe:
         drop(w);
@@ -680,9 +658,8 @@ mod test {
             .expect("the ready is ok");
 
         // empty and now closed:
-        let (bs, state) = reader.read(1).unwrap();
-        assert!(bs.is_empty());
-        assert_eq!(state, StreamState::Closed);
+        let res = reader.read(1);
+        assert!(matches!(res, Err(StreamError::Closed)));
     }
 
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
@@ -705,9 +682,8 @@ mod test {
 
         // Now we expect the reader task has sent 4k from the stream to the reader.
         // Try to read out one bigger than the buffer available:
-        let (bs, state) = reader.read(4097).unwrap();
+        let bs = reader.read(4097).unwrap();
         assert_eq!(bs.len(), 4096);
-        assert_eq!(state, StreamState::Open);
 
         // Allow the crank to turn more:
         resolves_immediately(reader.ready())
@@ -716,9 +692,8 @@ mod test {
 
         // Again we expect the reader task has sent 4k from the stream to the reader.
         // Try to read out one bigger than the buffer available:
-        let (bs, state) = reader.read(4097).unwrap();
+        let bs = reader.read(4097).unwrap();
         assert_eq!(bs.len(), 4096);
-        assert_eq!(state, StreamState::Open);
 
         // The writer task is now finished - join with it:
         let w = resolves_immediately(writer_task).await;
@@ -732,9 +707,8 @@ mod test {
             .expect("ready is ok");
 
         // Now we expect the reader to be empty, and the stream closed:
-        let (bs, state) = reader.read(4097).unwrap();
-        assert_eq!(bs.len(), 0);
-        assert_eq!(state, StreamState::Closed);
+        let res = reader.read(4097);
+        assert!(matches!(res, Err(StreamError::Closed)));
     }
 
     #[test_log::test(test_log::test(tokio::test(flavor = "multi_thread")))]
@@ -805,7 +779,7 @@ mod test {
                 // worker hasn't processed write yet:
                 Ok(1023) => {}
                 // worker reports failure:
-                Err(OutputStreamError::LastOperationFailed(_)) => {
+                Err(StreamError::LastOperationFailed(_)) => {
                     tracing::debug!("discovered stream failure in first write_ready");
                     should_be_closed = true;
                 }
@@ -819,13 +793,13 @@ mod test {
         let flush_res = writer.flush();
         match flush_res {
             // worker reports failure:
-            Err(OutputStreamError::LastOperationFailed(_)) => {
+            Err(StreamError::LastOperationFailed(_)) => {
                 tracing::debug!("discovered stream failure trying to flush");
                 assert!(!should_be_closed);
                 should_be_closed = true;
             }
             // Already reported failure, now closed
-            Err(OutputStreamError::Closed) => {
+            Err(StreamError::Closed) => {
                 assert!(
                     should_be_closed,
                     "expected a LastOperationFailed before we see Closed. {write_ready_res:?}"
@@ -840,12 +814,12 @@ mod test {
         // closed.
         match resolves_immediately(writer.write_ready()).await {
             // worker reports failure:
-            Err(OutputStreamError::LastOperationFailed(_)) => {
+            Err(StreamError::LastOperationFailed(_)) => {
                 tracing::debug!("discovered stream failure trying to flush");
                 assert!(!should_be_closed);
             }
             // Already reported failure, now closed
-            Err(OutputStreamError::Closed) => {
+            Err(StreamError::Closed) => {
                 assert!(should_be_closed);
             }
             r => {

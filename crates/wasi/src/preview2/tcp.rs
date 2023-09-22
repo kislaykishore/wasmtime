@@ -1,7 +1,7 @@
-use super::{HostInputStream, HostOutputStream, OutputStreamError};
 use crate::preview2::bindings::sockets::tcp::TcpSocket;
 use crate::preview2::{
-    with_ambient_tokio_runtime, AbortOnDropJoinHandle, StreamState, Table, TableError,
+    with_ambient_tokio_runtime, AbortOnDropJoinHandle, HostInputStream, HostOutputStream,
+    StreamError, Table, TableError,
 };
 use cap_net_ext::{AddressFamily, Blocking, TcpListenerExt};
 use cap_std::net::TcpListener;
@@ -66,23 +66,20 @@ impl TcpReadStream {
             closed: false,
         }
     }
-    fn stream_state(&self) -> StreamState {
-        if self.closed {
-            StreamState::Closed
-        } else {
-            StreamState::Open
-        }
-    }
 }
 
 #[async_trait::async_trait]
 impl HostInputStream for TcpReadStream {
-    fn read(&mut self, size: usize) -> Result<(bytes::Bytes, StreamState), anyhow::Error> {
-        if size == 0 || self.closed {
-            return Ok((bytes::Bytes::new(), self.stream_state()));
+    fn read(&mut self, size: usize) -> Result<bytes::Bytes, StreamError> {
+        if self.closed {
+            return Err(StreamError::Closed);
+        }
+        if size == 0 {
+            return Ok(bytes::Bytes::new());
         }
 
         let mut buf = bytes::BytesMut::with_capacity(size);
+        // This try_read_buf method takes &self and is guaranteed not to block:
         let n = match self.stream.try_read_buf(&mut buf) {
             // A 0-byte read indicates that the stream has closed.
             Ok(0) => {
@@ -103,7 +100,10 @@ impl HostInputStream for TcpReadStream {
         };
 
         buf.truncate(n);
-        Ok((buf.freeze(), self.stream_state()))
+        if self.closed {
+            return Err(StreamError::Closed);
+        }
+        Ok(buf.freeze())
     }
 
     async fn ready(&mut self) -> Result<(), anyhow::Error> {
@@ -161,9 +161,9 @@ impl TcpWriteStream {
 
 #[async_trait::async_trait]
 impl HostOutputStream for TcpWriteStream {
-    fn write(&mut self, mut bytes: bytes::Bytes) -> Result<(), OutputStreamError> {
+    fn write(&mut self, mut bytes: bytes::Bytes) -> Result<(), StreamError> {
         if self.write_handle.is_some() {
-            return Err(OutputStreamError::Trap(anyhow::anyhow!(
+            return Err(StreamError::Trap(anyhow::anyhow!(
                 "unpermitted: cannot write while background write ongoing"
             )));
         }
@@ -181,25 +181,25 @@ impl HostOutputStream for TcpWriteStream {
                     return Ok(());
                 }
 
-                Err(e) => return Err(OutputStreamError::LastOperationFailed(e.into())),
+                Err(e) => return Err(StreamError::LastOperationFailed(e.into())),
             }
         }
 
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<(), OutputStreamError> {
+    fn flush(&mut self) -> Result<(), StreamError> {
         // `flush` is a no-op here, as we're not managing any internal buffer. Additionally,
         // `write_ready` will join the background write task if it's active, so following `flush`
         // with `write_ready` will have the desired effect.
         Ok(())
     }
 
-    async fn write_ready(&mut self) -> Result<usize, OutputStreamError> {
+    async fn write_ready(&mut self) -> Result<usize, StreamError> {
         if let Some(handle) = &mut self.write_handle {
             handle
                 .await
-                .map_err(|e| OutputStreamError::LastOperationFailed(e.into()))?;
+                .map_err(|e| StreamError::LastOperationFailed(e.into()))?;
 
             // Only clear out the write handle once the task has exited, to ensure that
             // `write_ready` remains cancel-safe.
@@ -209,7 +209,7 @@ impl HostOutputStream for TcpWriteStream {
         self.stream
             .writable()
             .await
-            .map_err(|e| OutputStreamError::LastOperationFailed(e.into()))?;
+            .map_err(|e| StreamError::LastOperationFailed(e.into()))?;
 
         Ok(SOCKET_READY_SIZE)
     }

@@ -1,5 +1,5 @@
 use super::worker_thread_stdin;
-use crate::preview2::{pipe::AsyncReadStream, HostInputStream, StreamState};
+use crate::preview2::{pipe::AsyncReadStream, HostInputStream, StreamError};
 use anyhow::Error;
 use bytes::Bytes;
 use futures::ready;
@@ -73,7 +73,7 @@ impl is_terminal::IsTerminal for Stdin {
 
 #[async_trait::async_trait]
 impl crate::preview2::HostInputStream for Stdin {
-    fn read(&mut self, size: usize) -> Result<(Bytes, StreamState), Error> {
+    fn read(&mut self, size: usize) -> Result<Bytes, StreamError> {
         match self {
             Stdin::Async(s) => HostInputStream::read(&mut *s.lock().unwrap(), size),
             Stdin::Blocking(s) => s.read(size),

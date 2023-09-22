@@ -1,4 +1,4 @@
-use crate::preview2::{HostInputStream, StreamState};
+use crate::preview2::{HostInputStream, StreamError};
 use anyhow::Error;
 use bytes::{Bytes, BytesMut};
 use std::io::Read;
@@ -99,21 +99,19 @@ impl is_terminal::IsTerminal for Stdin {
 
 #[async_trait::async_trait]
 impl HostInputStream for Stdin {
-    fn read(&mut self, size: usize) -> Result<(Bytes, StreamState), Error> {
+    fn read(&mut self, size: usize) -> Result<Bytes, StreamError> {
         let g = Stdin::get_global();
         let mut locked = g.state.lock().unwrap();
 
         if let Some(e) = locked.error.take() {
-            return Err(e.into());
+            return Err(StreamError::LastOperationFailed(e.into()));
+        }
+        if locked.buffer.is_empty() && locked.closed {
+            return Err(StreamError::Closed);
         }
         let size = locked.buffer.len().min(size);
         let bytes = locked.buffer.split_to(size);
-        let state = if locked.buffer.is_empty() && locked.closed {
-            StreamState::Closed
-        } else {
-            StreamState::Open
-        };
-        Ok((bytes.freeze(), state))
+        Ok(bytes.freeze())
     }
 
     async fn ready(&mut self) -> Result<(), Error> {

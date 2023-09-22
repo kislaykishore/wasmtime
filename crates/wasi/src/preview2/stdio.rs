@@ -4,7 +4,7 @@ use crate::preview2::bindings::cli::{
 };
 use crate::preview2::bindings::io::streams;
 use crate::preview2::pipe::AsyncWriteStream;
-use crate::preview2::{HostOutputStream, OutputStreamError, WasiView};
+use crate::preview2::{HostOutputStream, StreamError, WasiView};
 use anyhow::bail;
 use bytes::Bytes;
 use is_terminal::IsTerminal;
@@ -41,13 +41,13 @@ impl IsTerminal for Stdout {
 }
 #[async_trait::async_trait]
 impl HostOutputStream for Stdout {
-    fn write(&mut self, bytes: Bytes) -> Result<(), OutputStreamError> {
+    fn write(&mut self, bytes: Bytes) -> Result<(), StreamError> {
         self.0.write(bytes)
     }
-    fn flush(&mut self) -> Result<(), OutputStreamError> {
+    fn flush(&mut self) -> Result<(), StreamError> {
         self.0.flush()
     }
-    async fn write_ready(&mut self) -> Result<usize, OutputStreamError> {
+    async fn write_ready(&mut self) -> Result<usize, StreamError> {
         self.0.write_ready().await
     }
 }
@@ -67,13 +67,13 @@ impl IsTerminal for Stderr {
 }
 #[async_trait::async_trait]
 impl HostOutputStream for Stderr {
-    fn write(&mut self, bytes: Bytes) -> Result<(), OutputStreamError> {
+    fn write(&mut self, bytes: Bytes) -> Result<(), StreamError> {
         self.0.write(bytes)
     }
-    fn flush(&mut self) -> Result<(), OutputStreamError> {
+    fn flush(&mut self) -> Result<(), StreamError> {
         self.0.flush()
     }
-    async fn write_ready(&mut self) -> Result<usize, OutputStreamError> {
+    async fn write_ready(&mut self) -> Result<usize, StreamError> {
         self.0.write_ready().await
     }
 }
@@ -164,7 +164,7 @@ impl<T: WasiView> terminal_stderr::Host for T {
 
 #[cfg(all(unix, test))]
 mod test {
-    use crate::preview2::{HostInputStream, StreamState};
+    use crate::preview2::{HostInputStream, StreamError};
     use libc;
     use std::fs::File;
     use std::io::{BufRead, BufReader, Write};
@@ -256,12 +256,9 @@ mod test {
                                     stdin.ready().await.unwrap();
 
                                     println!("child: reading input");
-                                    let (bytes, status) = stdin.read(1024).unwrap();
+                                    let bytes = stdin.read(1024).unwrap();
 
-                                    println!("child: {:?}, {:?}", bytes, status);
-
-                                    // We can't effectively test for the case where stdin was closed.
-                                    assert_eq!(status, StreamState::Open);
+                                    println!("child: {:?}", bytes);
 
                                     buffer.push_str(std::str::from_utf8(bytes.as_ref()).unwrap());
                                     if let Some((line, rest)) = buffer.split_once('\n') {
