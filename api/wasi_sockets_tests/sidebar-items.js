@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["example_body","wait","write"],"mod":["wasi"],"struct":["DropPollable"]};

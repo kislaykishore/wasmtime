@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["preload"],"mod":["backend","wit","witx"],"struct":["Backend","ExecutionContext","Graph","InMemoryRegistry","Registry","WasiNnCtx"],"trait":["GraphRegistry"]};

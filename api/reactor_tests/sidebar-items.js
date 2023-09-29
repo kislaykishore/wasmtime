@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"mod":["wasi"],"trait":["Guest"],"type":["DescriptorStat","OutputStream"]};
